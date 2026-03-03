@@ -368,10 +368,11 @@ var defaultOptions = {
 };
 function jsQR(data, width, height, providedOptions) {
     if (providedOptions === void 0) { providedOptions = {}; }
-    var options = defaultOptions;
-    Object.keys(options || {}).forEach(function (opt) {
-        options[opt] = providedOptions[opt] || options[opt];
-    });
+    // ★ defaultOptionsとprovidedOptionsを合成して、appEncMaskを確実に引き継ぐ
+    var options = {
+        inversionAttempts: providedOptions.inversionAttempts || defaultOptions.inversionAttempts,
+        appEncMask: providedOptions.appEncMask
+    };
     var shouldInvert = options.inversionAttempts === "attemptBoth" || options.inversionAttempts === "invertFirst";
     var tryInvertedFirst = options.inversionAttempts === "onlyInvert" || options.inversionAttempts === "invertFirst";
     var _a = binarizer_1.binarize(data, width, height, shouldInvert), binarized = _a.binarized, inverted = _a.inverted;
