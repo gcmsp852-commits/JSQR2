@@ -201,6 +201,14 @@
   let appMaskArr = null;
 
   // =========================
+  // ★追加：first追跡（緑枠が固まらないため）
+  // =========================
+  let lastFirstSeenAt = 0;
+  let lastFirstTrackAt = 0;
+  const FIRST_TRACK_INTERVAL_MS = 120;   // first追跡頻度
+  const FIRST_LOST_RESET_MS = 1500;      // first見失いリセット猶予
+
+  // =========================
   // Start / Password
   // =========================
   async function startApp() {
@@ -265,7 +273,7 @@
     if (pw) {
       appPassword = pw;
       appMask = deriveEncryptionMaskBytes(appPassword, 5000);
-      appMaskArr = Array.from(appMask); // ★ここで1回だけ作る（重い処理をループから排除）
+      appMaskArr = Array.from(appMask); // ★ここで1回だけ作る
     }
     document.getElementById('passwordScreen').style.display = 'none';
     isScanning = true;
@@ -327,15 +335,13 @@
     return 0;
   }
 
-  // ★距離判定（あなたの採用希望ロジック）
+  // ★距離判定（採用ロジック）
   function isDifferentSecondCandidate(first, cand) {
     if (!first || !cand) return false;
     if (!first.center || !cand.center) return false;
 
-    // 条件(1) テキストが違う
     if (cand.text && first.text && cand.text !== first.text) return true;
 
-    // 条件(2) テキスト一致でも距離が離れていれば別
     const dist = getDistance(first.center, cand.center);
     const qrSize = estimateQrSize(cand) || estimateQrSize(first) || 0;
     const thr = Math.min(overlayCanvas.width * 0.1, qrSize * 0.45);
@@ -358,7 +364,7 @@
     return null;
   }
 
-  // ★srcCanvas を渡せるように（既存を崩さず末尾に追加）
+  // ★srcCanvas を渡せるように
   function decodeRegion(frameW, frameH, sx, sy, sw, sh, scale, useMask, srcCanvas = zxingCanvas) {
     sx = clamp(sx, 0, frameW - 2);
     sy = clamp(sy, 0, frameH - 2);
@@ -389,14 +395,12 @@
   }
 
   function findFirstRobust(frameW, frameH, useMask, srcCanvas = zxingCanvas) {
-    // 1) フルフレーム（スケール違い）
     const fullScales = [1.0, 0.86, 1.18];
     for (const sc of fullScales) {
       const got = decodeRegion(frameW, frameH, 0, 0, frameW, frameH, sc, useMask, srcCanvas);
       if (got) return got;
     }
 
-    // 2) タイル探索（中心→四隅→辺）
     const tileRatios = [0.72, 0.62];
     const scales = [1.0, 1.18];
 
@@ -502,28 +506,70 @@
   }
 
   // =========================
+  // ★追加：first追跡（緑枠が固まらない）
+  // =========================
+  function trackFirstQuick(frameW, frameH) {
+    if (!firstQR?.points) return false;
+
+    const bb = bboxFromPoints(firstQR.points);
+    if (!bb) return false;
+
+    const pad = Math.max(40, Math.floor(Math.max(bb.w, bb.h) * 0.35));
+    const sx = Math.floor(bb.x - pad);
+    const sy = Math.floor(bb.y - pad);
+    const sw = Math.floor(bb.w + pad * 2);
+    const sh = Math.floor(bb.h + pad * 2);
+
+    const scales = [1.18, 1.0];
+
+    // まずマスク無し（first追跡向き）
+    for (const sc of scales) {
+      const got = decodeRegion(frameW, frameH, sx, sy, sw, sh, sc, false, zxingCanvas);
+      if (got && !isDifferentSecondCandidate(firstQR, got)) {
+        firstQR.points = got.points;
+        firstQR.center = got.center;
+        firstQR.managementCode = got.managementCode;
+        lastFirstSeenAt = Date.now();
+        return true;
+      }
+    }
+
+    // うまくいかない時だけマスクありも試す
+    if (appMaskArr) {
+      for (const sc of scales) {
+        const got = decodeRegion(frameW, frameH, sx, sy, sw, sh, sc, true, zxingCanvas);
+        if (got && !isDifferentSecondCandidate(firstQR, got)) {
+          firstQR.points = got.points;
+          firstQR.center = got.center;
+          firstQR.managementCode = got.managementCode;
+          lastFirstSeenAt = Date.now();
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  // =========================
   // ★追加：first領域を塗り潰して第2を再デコード
   // =========================
   function buildMaskedFrameFromFirst(first, frameW, frameH, fill = "black") {
     maskedCanvas.width = frameW;
     maskedCanvas.height = frameH;
 
-    // 元フレームをコピー
     maskedCtx.clearRect(0, 0, frameW, frameH);
     maskedCtx.drawImage(zxingCanvas, 0, 0);
 
-    // firstの領域（points）を塗り潰し（少し拡張して干渉を消す）
     const bb = bboxFromPoints(first?.points || []);
     if (!bb) return;
 
-    // ★bboxベースで少し余白を増やす（重層での干渉をより消す）
     const pad = 24;
     const x = clamp(Math.floor(bb.x - pad), 0, frameW - 1);
     const y = clamp(Math.floor(bb.y - pad), 0, frameH - 1);
     const w = clamp(Math.floor(bb.w + pad*2), 1, frameW - x);
     const h = clamp(Math.floor(bb.h + pad*2), 1, frameH - y);
 
-    // 塗り色（黒→ダメなら白を後で試す）
     maskedCtx.save();
     maskedCtx.globalCompositeOperation = "source-over";
     maskedCtx.fillStyle = (fill === "white") ? "#ffffff" : "#000000";
@@ -532,15 +578,12 @@
   }
 
   function findSecondWithFirstMasked(first, frameW, frameH, useMask) {
-    // (1) まずは「マスク済みフレーム」から、普通に1個拾う（= 第2が単体として残っているはず）
     let got = findFirstRobust(frameW, frameH, useMask, maskedCanvas);
     if (got && isDifferentSecondCandidate(first, got)) return got;
 
-    // (2) 念のため縮小フルフレーム追試（軽い）
     got = decodeRegion(frameW, frameH, 0, 0, frameW, frameH, 0.92, useMask, maskedCanvas);
     if (got && isDifferentSecondCandidate(first, got)) return got;
 
-    // (3) さらに「距離探索」もマスク済みで実施（位置関係が必要なケース）
     got = findSecondByDistance(first, frameW, frameH, useMask, maskedCanvas);
     if (got && isDifferentSecondCandidate(first, got)) return got;
 
@@ -570,13 +613,29 @@
       let detectedItems = [];
 
       try {
-        // フルフレーム取り込み
         zxingCanvas.width = overlayCanvas.width;
         zxingCanvas.height = overlayCanvas.height;
         zxingCtx.drawImage(video, 0, 0, zxingCanvas.width, zxingCanvas.height);
 
         const W = zxingCanvas.width;
         const H = zxingCanvas.height;
+
+        // =========================
+        // ★追加：first追跡（緑枠の固定を防ぐ）
+        // ※③ first領域マスク→再デコード を崩さず、その前に追従させる
+        // =========================
+        if (firstQR && !secondQR) {
+          const t = Date.now();
+          if (t - lastFirstTrackAt >= FIRST_TRACK_INTERVAL_MS) {
+            lastFirstTrackAt = t;
+            const ok = trackFirstQuick(W, H);
+            if (!ok && (t - lastFirstSeenAt) > FIRST_LOST_RESET_MS) {
+              firstQR = null;
+              document.getElementById('text1').innerText = "未検出";
+              document.getElementById('mg1').innerText = "--";
+            }
+          }
+        }
 
         let item = null;
         let usedMask = false;
@@ -586,7 +645,8 @@
         // -------------------------
         if (!firstQR) {
           item = findFirstRobust(W, H, false, zxingCanvas);
-          if (!item && appMaskArr) { item = findFirstRobust(W, H, true, zxingCanvas); usedMask = !!item; }
+          if (item) lastFirstSeenAt = Date.now();
+          if (!item && appMaskArr) { item = findFirstRobust(W, H, true, zxingCanvas); usedMask = !!item; if (item) lastFirstSeenAt = Date.now(); }
           else usedMask = false;
         } else {
           // -------------------------
@@ -612,7 +672,7 @@
             found = findSecondWithFirstMasked(firstQR, W, H, false);
             if (!found && appMaskArr) found = findSecondWithFirstMasked(firstQR, W, H, true);
 
-            // ★(C-2) まだダメなら白塗りも試す（背景や反転に強くする）
+            // ★(C-2) 白塗りも試す
             if (!found) {
               buildMaskedFrameFromFirst(firstQR, W, H, "white");
               found = findSecondWithFirstMasked(firstQR, W, H, false);
@@ -630,7 +690,6 @@
               }
             }
 
-            // second候補が取れたら、それを優先して渡す
             if (found) {
               item = found;
               usedMask = !!found._usedMask;
@@ -694,25 +753,27 @@
     if (items.length === 0) return;
 
     if (items.length >= 2) {
-      if (!firstQR) { firstQR = items[0]; secondQR = items[1]; updateUI(); return; }
+      if (!firstQR) { firstQR = items[0]; secondQR = items[1]; lastFirstSeenAt = Date.now(); updateUI(); return; }
       if (firstQR && !secondQR) {
         const dist0 = getDistance(firstQR.center, items[0].center);
         const dist1 = getDistance(firstQR.center, items[1].center);
-        if (dist0 > dist1) { secondQR = items[0]; firstQR = items[1]; } else { secondQR = items[1]; firstQR = items[0]; }
+        if (dist0 > dist1) { secondQR = items[0]; firstQR = items[1]; }
+        else { secondQR = items[1]; firstQR = items[0]; }
+        lastFirstSeenAt = Date.now();
         updateUI(); return;
       }
     }
 
     if (items.length === 1) {
       const item = items[0];
-      if (!firstQR) { firstQR = item; updateUI(); }
+      if (!firstQR) { firstQR = item; lastFirstSeenAt = Date.now(); updateUI(); }
       else if (!secondQR) {
         if (item.text !== firstQR.text) { secondQR = item; updateUI(); }
         else {
           const dist = getDistance(firstQR.center, item.center);
           const qrSize = getDistance(item.points[0], item.points[1]);
           if (dist > Math.min(overlayCanvas.width * 0.1, qrSize * 0.45)) { secondQR = item; updateUI(); }
-          else { firstQR.points = item.points; firstQR.center = item.center; }
+          else { firstQR.points = item.points; firstQR.center = item.center; lastFirstSeenAt = Date.now(); }
         }
       }
     }
@@ -747,6 +808,11 @@
 
   function goBack() {
     firstQR = null; secondQR = null; appPassword = null; appMask = null; appMaskArr = null;
+
+    // ★追加：first追跡状態もリセット
+    lastFirstSeenAt = 0;
+    lastFirstTrackAt = 0;
+
     document.getElementById('text1').innerText = "未検出"; document.getElementById('text2').innerText = "未検出";
     document.getElementById('mg1').innerText = "--"; document.getElementById('mg2').innerText = "--";
     document.getElementById('resultScreen').style.display = 'none';
