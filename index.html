@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -161,6 +162,8 @@
     const overlayCanvas = document.getElementById('overlayCanvas');
     const ctx = overlayCanvas.getContext('2d');
     const zxingCanvas = document.createElement('canvas');
+    const workCanvas = document.createElement('canvas');
+    const workCtx = workCanvas.getContext('2d', { willReadFrequently: true });
     const zxingCtx = zxingCanvas.getContext('2d', { willReadFrequently: true });
 
     let isProcessing = false;
@@ -230,6 +233,218 @@
         return Math.sqrt(Math.pow(p1.x - p2.x, 2) + Math.pow(p1.y - p2.y, 2));
     }
 
+
+        // =========================
+    // 感度改善：jsQR 多段探索（スケール/タイル/除外）
+    // =========================
+    function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+    function bboxFromPoints(points) {
+        if (!points || points.length === 0) return null;
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (const p of points) {
+            minX = Math.min(minX, p.x); minY = Math.min(minY, p.y);
+            maxX = Math.max(maxX, p.x); maxY = Math.max(maxY, p.y);
+        }
+        const pad = 14;
+        return {
+            x: Math.max(0, minX - pad),
+            y: Math.max(0, minY - pad),
+            w: (maxX - minX) + pad * 2,
+            h: (maxY - minY) + pad * 2
+        };
+    }
+
+    function mapLocationToPoints(loc, sx, sy, scale) {
+        // loc.*Corner は workCanvas 座標。元フレームに戻す： /scale + offset
+        const inv = 1 / scale;
+        const tl = loc.topLeftCorner, tr = loc.topRightCorner, br = loc.bottomRightCorner, bl = loc.bottomLeftCorner;
+        return [
+            { x: tl.x * inv + sx, y: tl.y * inv + sy },
+            { x: tr.x * inv + sx, y: tr.y * inv + sy },
+            { x: br.x * inv + sx, y: br.y * inv + sy },
+            { x: bl.x * inv + sx, y: bl.y * inv + sy },
+        ];
+    }
+
+    function estimateQrSize(item) {
+        if (item?.points && item.points.length >= 2) return getDistance(item.points[0], item.points[1]);
+        const bb = bboxFromPoints(item?.points || []);
+        if (bb) return Math.max(bb.w, bb.h);
+        return 0;
+    }
+
+    function isDifferentSecondCandidate(first, cand) {
+        if (!first || !cand) return false;
+        if (!first.center || !cand.center) return false;
+
+        // 条件(1) テキストが違う
+        if (cand.text && first.text && cand.text !== first.text) return true;
+
+        // 条件(2) テキスト一致でも距離が離れていれば別
+        const dist = getDistance(first.center, cand.center);
+        const qrSize = estimateQrSize(cand) || estimateQrSize(first) || 0;
+        const thr = Math.min(overlayCanvas.width * 0.1, qrSize * 0.45);
+        return dist > thr;
+    }
+
+    function jsqrDecode(imageData, useMask) {
+        // 既存挙動に合わせ：通常→(必要なら)mask の順で呼べるようにする
+        if (!useMask) {
+            return jsQR(imageData.data, imageData.width, imageData.height, { inversionAttempts: "attemptBoth" });
+        }
+        if (appMask) {
+            return jsQR(imageData.data, imageData.width, imageData.height, {
+                inversionAttempts: "attemptBoth",
+                appEncMask: Array.from(appMask)
+            });
+        }
+        return null;
+    }
+
+    function decodeRegion(frameW, frameH, sx, sy, sw, sh, scale, useMask) {
+        sx = clamp(sx, 0, frameW - 2);
+        sy = clamp(sy, 0, frameH - 2);
+        sw = clamp(sw, 2, frameW - sx);
+        sh = clamp(sh, 2, frameH - sy);
+
+        const tw = Math.max(80, Math.floor(sw * scale));
+        const th = Math.max(80, Math.floor(sh * scale));
+
+        workCanvas.width = tw;
+        workCanvas.height = th;
+        workCtx.clearRect(0, 0, tw, th);
+
+        // zxingCanvas（=フルフレーム）から切り出してリスケール
+        workCtx.drawImage(zxingCanvas, sx, sy, sw, sh, 0, 0, tw, th);
+
+        const img = workCtx.getImageData(0, 0, tw, th);
+        const code = jsqrDecode(img, useMask);
+        if (!code) return null;
+
+        const pts = mapLocationToPoints(code.location, sx, sy, scale);
+        return {
+            text: code.data,
+            managementCode: code.managementCode,
+            points: pts,
+            center: getCenter(pts),
+            _usedMask: useMask
+        };
+    }
+
+    function findFirstRobust(frameW, frameH, useMask) {
+        // 1) フルフレーム（スケール違い）
+        const fullScales = [1.0, 0.86, 1.18];
+        for (const sc of fullScales) {
+            const got = decodeRegion(frameW, frameH, 0, 0, frameW, frameH, sc, useMask);
+            if (got) return got;
+        }
+
+        // 2) タイル探索（中心→四隅→辺）
+        const tileRatios = [0.72, 0.62];
+        const scales = [1.0, 1.18];
+
+        for (const tr of tileRatios) {
+            const tw = Math.floor(frameW * tr);
+            const th = Math.floor(frameH * tr);
+
+            const positions = [
+                { x: (frameW - tw) / 2, y: (frameH - th) / 2 },
+                { x: 0, y: 0 }, { x: frameW - tw, y: 0 }, { x: 0, y: frameH - th }, { x: frameW - tw, y: frameH - th },
+                { x: (frameW - tw) / 2, y: 0 }, { x: (frameW - tw) / 2, y: frameH - th },
+                { x: 0, y: (frameH - th) / 2 }, { x: frameW - tw, y: (frameH - th) / 2 },
+            ];
+
+            for (const pos of positions) {
+                for (const sc of scales) {
+                    const got = decodeRegion(frameW, frameH, Math.floor(pos.x), Math.floor(pos.y), tw, th, sc, useMask);
+                    if (got) return got;
+                }
+            }
+        }
+        return null;
+    }
+
+    function decodeFullFrameExcludingFirst(first, frameW, frameH, useMask) {
+        if (!first?.points) return null;
+        const bb = bboxFromPoints(first.points);
+        if (!bb) return null;
+
+        const pad = 20;
+        const ex = {
+            x: Math.max(0, bb.x - pad),
+            y: Math.max(0, bb.y - pad),
+            w: Math.min(frameW, bb.w + pad * 2),
+            h: Math.min(frameH, bb.h + pad * 2),
+        };
+
+        const tileRatios = [0.72, 0.62];
+        const scales = [1.0, 1.18];
+
+        for (const tr of tileRatios) {
+            const tw = Math.floor(frameW * tr);
+            const th = Math.floor(frameH * tr);
+
+            const positions = [
+                { x: (frameW - tw) / 2, y: (frameH - th) / 2 },
+                { x: 0, y: 0 }, { x: frameW - tw, y: 0 }, { x: 0, y: frameH - th }, { x: frameW - tw, y: frameH - th },
+                { x: (frameW - tw) / 2, y: 0 }, { x: (frameW - tw) / 2, y: frameH - th },
+                { x: 0, y: (frameH - th) / 2 }, { x: frameW - tw, y: (frameH - th) / 2 },
+            ];
+
+            for (const pos of positions) {
+                const sx = Math.floor(pos.x), sy = Math.floor(pos.y);
+
+                const overlapX = Math.max(0, Math.min(sx + tw, ex.x + ex.w) - Math.max(sx, ex.x));
+                const overlapY = Math.max(0, Math.min(sy + th, ex.y + ex.h) - Math.max(sy, ex.y));
+                const overlapArea = overlapX * overlapY;
+                const tileArea = tw * th;
+                if (tileArea > 0 && overlapArea / tileArea > 0.35) continue;
+
+                for (const sc of scales) {
+                    const got = decodeRegion(frameW, frameH, sx, sy, tw, th, sc, useMask);
+                    if (got && isDifferentSecondCandidate(first, got)) return got;
+                }
+            }
+        }
+        return null;
+    }
+
+    function findSecondByDistance(first, frameW, frameH, useMask) {
+        if (!first?.center) return null;
+
+        const cx = first.center.x;
+        const cy = first.center.y;
+
+        const baseSize = Math.max(estimateQrSize(first), 180);
+        const radiiKs = [1.0, 1.5, 2.1];
+        const roiSizes = [
+            clamp(baseSize * 1.35, 160, 560),
+            clamp(baseSize * 1.70, 220, 720),
+        ];
+        const scales = [1.18, 1.0, 0.86];
+
+        const N = 14;
+        for (const roi of roiSizes) {
+            for (const k of radiiKs) {
+                const r = baseSize * k;
+                for (let i = 0; i < N; i++) {
+                    const ang = (Math.PI * 2 * i) / N;
+                    const tx = cx + Math.cos(ang) * r;
+                    const ty = cy + Math.sin(ang) * r;
+                    const sx = Math.floor(tx - roi / 2);
+                    const sy = Math.floor(ty - roi / 2);
+
+                    for (const sc of scales) {
+                        const got = decodeRegion(frameW, frameH, sx, sy, roi, roi, sc, useMask);
+                        if (got && isDifferentSecondCandidate(first, got)) return got;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
     async function scanLoop() {
         if (!isScanning) return;
         if (video.videoWidth && overlayCanvas.width !== video.videoWidth) {
@@ -251,40 +466,79 @@
                 zxingCanvas.width = overlayCanvas.width;
                 zxingCanvas.height = overlayCanvas.height;
                 zxingCtx.drawImage(video, 0, 0, zxingCanvas.width, zxingCanvas.height);
-                const imageData = zxingCtx.getImageData(0, 0, zxingCanvas.width, zxingCanvas.height);
-                
-                // ① まず通常のオプションなしでスキャン（第1QR用）
-                let code = jsQR(imageData.data, imageData.width, imageData.height);
+
+                const W = zxingCanvas.width;
+                const H = zxingCanvas.height;
+
+                // --------
+                // (A) first が未確定なら：スケール/タイルで「まず1個取る」
+                // --------
+                let item = null;
                 let usedMask = false;
-                
-                // ② 通常で失敗し、かつパスワード(マスク)入力済みなら、第2QRの可能性があるのでマスクありでスキャン
-                if (!code && appMask) {
-                    code = jsQR(imageData.data, imageData.width, imageData.height, { appEncMask: Array.from(appMask) });
-                    if (code) usedMask = true;
+
+                if (!firstQR) {
+                    item = findFirstRobust(W, H, false);
+                    if (!item && appMask) { item = findFirstRobust(W, H, true); usedMask = !!item; }
+                    else usedMask = false;
+                } else {
+                    // --------
+                    // (B) first があるなら：まず軽い追跡（フルフレーム縮小）で更新/2個目が紛れて取れるのを拾う
+                    // --------
+                    const got = decodeRegion(W, H, 0, 0, W, H, 0.92, false) || (appMask ? decodeRegion(W, H, 0, 0, W, H, 0.92, true) : null);
+                    if (got) {
+                        item = got;
+                        usedMask = !!got._usedMask;
+                    }
+
+                    // --------
+                    // (C) second が未確定なら：first領域除外→距離探索（WASM版と同じ発想）
+                    // --------
+                    if (firstQR && !secondQR) {
+                        let found = decodeFullFrameExcludingFirst(firstQR, W, H, false);
+                        if (!found && appMask) found = decodeFullFrameExcludingFirst(firstQR, W, H, true);
+
+                        if (!found) {
+                            found = findSecondByDistance(firstQR, W, H, false);
+                            if (!found && appMask) found = findSecondByDistance(firstQR, W, H, true);
+                        }
+
+                        // second候補が取れたら、それを優先して processDetections に渡す
+                        if (found) {
+                            item = found;
+                            usedMask = !!found._usedMask;
+                        }
+                    }
                 }
-                
-                if (code) {
-                    const mgmtStr = code.managementCode !== undefined ? code.managementCode.toString(2).padStart(16, '0') : "0000000000000000";
-                    
-                    // 第1QR（マスクを使わずに読めた）で、かつ暗号化フラグがONの場合
+
+                if (item) {
+                    const mgmtStr = item.managementCode !== undefined
+                        ? item.managementCode.toString(2).padStart(16, '0')
+                        : "0000000000000000";
+
+                    // 既存仕様：第1QR（マスク無しで読めた）かつ 暗号化フラグON → パスワード要求
                     if (!usedMask && mgmtStr[7] === '1') {
                         if (!appPassword && document.getElementById('passwordScreen').style.display !== 'flex') {
-                            
-                            // 画面に「第1のQR」として表示させるためにまずは登録
-                            const pts = [ code.location.topLeftCorner, code.location.topRightCorner, code.location.bottomRightCorner, code.location.bottomLeftCorner ];
-                            detectedItems = [{ text: code.data, managementCode: code.managementCode, points: pts, center: getCenter(pts) }];
+                            detectedItems = [{
+                                text: item.text,
+                                managementCode: item.managementCode,
+                                points: item.points,
+                                center: item.center
+                            }];
                             processDetections(detectedItems);
 
-                            // パスワード入力を求めて一時停止
                             showPasswordScreen();
                             isProcessing = false;
-                            return; 
+                            return;
                         }
                     }
 
-                    // 通常の登録処理（パスワード不要な場合、または第2QRが読めた場合など）
-                    const pts = [ code.location.topLeftCorner, code.location.topRightCorner, code.location.bottomRightCorner, code.location.bottomLeftCorner ];
-                    detectedItems = [{ text: code.data, managementCode: code.managementCode, points: pts, center: getCenter(pts) }];
+                    // 通常の登録（既存と同じ形にして渡す）
+                    detectedItems = [{
+                        text: item.text,
+                        managementCode: item.managementCode,
+                        points: item.points,
+                        center: item.center
+                    }];
                 }
             } catch (err) {}
 
