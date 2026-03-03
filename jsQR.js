@@ -328,8 +328,8 @@ var binarizer_1 = __webpack_require__(4);
 var decoder_1 = __webpack_require__(5);
 var extractor_1 = __webpack_require__(11);
 var locator_1 = __webpack_require__(12);
-// ★修正：scan関数が appEncMask を受け取れるように変更
-function scan(matrix, appEncMask) {
+// ★ options を受け取れるように変更
+function scan(matrix, options) {
     var locations = locator_1.locate(matrix);
     if (!locations) {
         return null;
@@ -337,8 +337,9 @@ function scan(matrix, appEncMask) {
     for (var _i = 0, locations_1 = locations; _i < locations_1.length; _i++) {
         var location_1 = locations_1[_i];
         var extracted = extractor_1.extract(matrix, location_1);
-        // ★修正：decode関数へ appEncMask をパスする
-        var decoded = decoder_1.decode(extracted.matrix, appEncMask);
+        // ★ decode関数に appEncMask を渡す
+        // ★ decode関数に appEncMask を渡す
+        var decoded = decoder_1.decode(extracted.matrix, options ? options.appEncMask : undefined);
         if (decoded) {
             return {
                 binaryData: decoded.bytes,
@@ -356,6 +357,7 @@ function scan(matrix, appEncMask) {
                     bottomLeftFinderPattern: location_1.bottomLeft,
                     bottomRightAlignmentPattern: location_1.alignmentPattern,
                 },
+                matrix: matrix,
             };
         }
     }
@@ -373,10 +375,10 @@ function jsQR(data, width, height, providedOptions) {
     var shouldInvert = options.inversionAttempts === "attemptBoth" || options.inversionAttempts === "invertFirst";
     var tryInvertedFirst = options.inversionAttempts === "onlyInvert" || options.inversionAttempts === "invertFirst";
     var _a = binarizer_1.binarize(data, width, height, shouldInvert), binarized = _a.binarized, inverted = _a.inverted;
-    // ★修正：scan関数の呼び出し時に options.appEncMask を渡す
-    var result = scan(tryInvertedFirst ? inverted : binarized, options.appEncMask);
+    // ★ scan関数に options を渡す
+    var result = scan(tryInvertedFirst ? inverted : binarized, options);
     if (!result && (options.inversionAttempts === "attemptBoth" || options.inversionAttempts === "invertFirst")) {
-        result = scan(tryInvertedFirst ? binarized : inverted, options.appEncMask);
+        result = scan(tryInvertedFirst ? binarized : inverted, options);
     }
     return result;
 }
@@ -576,10 +578,9 @@ var DATA_MASKS = [
 function buildFunctionPatternMask(version) {
     var dimension = 17 + 4 * version.versionNumber;
     var matrix = BitMatrix_1.BitMatrix.createEmpty(dimension, dimension);
-    matrix.setRegion(0, 0, 9, 9, true); // Top left finder pattern + separator + format
-    matrix.setRegion(dimension - 8, 0, 8, 9, true); // Top right finder pattern + separator + format
-    matrix.setRegion(0, dimension - 8, 9, 8, true); // Bottom left finder pattern + separator + format
-    // Alignment patterns
+    matrix.setRegion(0, 0, 9, 9, true);
+    matrix.setRegion(dimension - 8, 0, 8, 9, true);
+    matrix.setRegion(0, dimension - 8, 9, 8, true);
     for (var _i = 0, _a = version.alignmentPatternCenters; _i < _a.length; _i++) {
         var x = _a[_i];
         for (var _b = 0, _c = version.alignmentPatternCenters; _b < _c.length; _b++) {
@@ -589,11 +590,11 @@ function buildFunctionPatternMask(version) {
             }
         }
     }
-    matrix.setRegion(6, 9, 1, dimension - 17, true); // Vertical timing pattern
-    matrix.setRegion(9, 6, dimension - 17, 1, true); // Horizontal timing pattern
+    matrix.setRegion(6, 9, 1, dimension - 17, true);
+    matrix.setRegion(9, 6, dimension - 17, 1, true);
     if (version.versionNumber > 6) {
-        matrix.setRegion(dimension - 11, 0, 3, 6, true); // Version info, top right
-        matrix.setRegion(0, dimension - 11, 6, 3, true); // Version info, bottom left
+        matrix.setRegion(dimension - 11, 0, 3, 6, true);
+        matrix.setRegion(0, dimension - 11, 6, 3, true);
     }
     return matrix;
 }
@@ -604,10 +605,9 @@ function readCodewords(matrix, version, formatInfo) {
     var codewords = [];
     var currentByte = 0;
     var bitsRead = 0;
-    // Read columns in pairs, from right to left
     var readingUp = true;
     for (var columnIndex = dimension - 1; columnIndex > 0; columnIndex -= 2) {
-        if (columnIndex === 6) { // Skip whole column with vertical alignment pattern;
+        if (columnIndex === 6) {
             columnIndex--;
         }
         for (var i = 0; i < dimension; i++) {
@@ -621,7 +621,7 @@ function readCodewords(matrix, version, formatInfo) {
                         bit = !bit;
                     }
                     currentByte = pushBit(bit, currentByte);
-                    if (bitsRead === 8) { // Whole bytes
+                    if (bitsRead === 8) {
                         codewords.push(currentByte);
                         bitsRead = 0;
                         currentByte = 0;
@@ -636,7 +636,7 @@ function readCodewords(matrix, version, formatInfo) {
 function readVersion(matrix) {
     var dimension = matrix.height;
     var provisionalVersion = Math.floor((dimension - 17) / 4);
-    if (provisionalVersion <= 6) { // 6 and under dont have version info in the QR code
+    if (provisionalVersion <= 6) {
         return version_1.VERSIONS[provisionalVersion - 1];
     }
     var topRightVersionBits = 0;
@@ -669,8 +669,6 @@ function readVersion(matrix) {
             bestDifference = difference;
         }
     }
-    // We can tolerate up to 3 bits of error since no two version info codewords will
-    // differ in less than 8 bits.
     if (bestDifference <= 3) {
         return bestVersion;
     }
@@ -678,21 +676,21 @@ function readVersion(matrix) {
 function readFormatInformation(matrix) {
     var topLeftFormatInfoBits = 0;
     for (var x = 0; x <= 8; x++) {
-        if (x !== 6) { // Skip timing pattern bit
+        if (x !== 6) {
             topLeftFormatInfoBits = pushBit(matrix.get(x, 8), topLeftFormatInfoBits);
         }
     }
     for (var y = 7; y >= 0; y--) {
-        if (y !== 6) { // Skip timing pattern bit
+        if (y !== 6) {
             topLeftFormatInfoBits = pushBit(matrix.get(8, y), topLeftFormatInfoBits);
         }
     }
     var dimension = matrix.height;
     var topRightBottomRightFormatInfoBits = 0;
-    for (var y = dimension - 1; y >= dimension - 7; y--) { // bottom left
+    for (var y = dimension - 1; y >= dimension - 7; y--) {
         topRightBottomRightFormatInfoBits = pushBit(matrix.get(8, y), topRightBottomRightFormatInfoBits);
     }
-    for (var x = dimension - 8; x < dimension; x++) { // top right
+    for (var x = dimension - 8; x < dimension; x++) {
         topRightBottomRightFormatInfoBits = pushBit(matrix.get(x, 8), topRightBottomRightFormatInfoBits);
     }
     var bestDifference = Infinity;
@@ -707,7 +705,7 @@ function readFormatInformation(matrix) {
             bestFormatInfo = formatInfo;
             bestDifference = difference;
         }
-        if (topLeftFormatInfoBits !== topRightBottomRightFormatInfoBits) { // also try the other option
+        if (topLeftFormatInfoBits !== topRightBottomRightFormatInfoBits) {
             difference = numBitsDiffering(topRightBottomRightFormatInfoBits, bits);
             if (difference < bestDifference) {
                 bestFormatInfo = formatInfo;
@@ -715,7 +713,6 @@ function readFormatInformation(matrix) {
             }
         }
     }
-    // Hamming distance of the 32 masked codes is 7, by construction, so <= 3 bits differing means we found a match
     if (bestDifference <= 3) {
         return bestFormatInfo;
     }
@@ -736,14 +733,12 @@ function getDataBlocks(codewords, version, ecLevel) {
     }
     codewords = codewords.slice(0, totalCodewords);
     var shortBlockSize = ecInfo.ecBlocks[0].dataCodewordsPerBlock;
-    // Pull codewords to fill the blocks up to the minimum size
     for (var i = 0; i < shortBlockSize; i++) {
         for (var _i = 0, dataBlocks_1 = dataBlocks; _i < dataBlocks_1.length; _i++) {
             var dataBlock = dataBlocks_1[_i];
             dataBlock.codewords.push(codewords.shift());
         }
     }
-    // If there are any large blocks, pull codewords to fill the last element of those
     if (ecInfo.ecBlocks.length > 1) {
         var smallBlockCount = ecInfo.ecBlocks[0].numBlocks;
         var largeBlockCount = ecInfo.ecBlocks[1].numBlocks;
@@ -751,7 +746,6 @@ function getDataBlocks(codewords, version, ecLevel) {
             dataBlocks[smallBlockCount + i].codewords.push(codewords.shift());
         }
     }
-    // Add the rest of the codewords to the blocks. These are the error correction codewords.
     while (codewords.length > 0) {
         for (var _a = 0, dataBlocks_2 = dataBlocks; _a < dataBlocks_2.length; _a++) {
             var dataBlock = dataBlocks_2[_a];
@@ -760,7 +754,7 @@ function getDataBlocks(codewords, version, ecLevel) {
     }
     return dataBlocks;
 }
-// ★修正：decodeMatrix が appEncMask を受け取れるように変更
+// ★ appEncMask を受け取れるように変更
 function decodeMatrix(matrix, appEncMask) {
     var version = readVersion(matrix);
     if (!version) {
@@ -771,7 +765,7 @@ function decodeMatrix(matrix, appEncMask) {
         return null;
     }
     var codewords = readCodewords(matrix, version, formatInfo);
-    // ★追加：アプリ暗号化フラグがONで、外部からマスクが渡されている場合はXOR復号を行う
+    // ★ 誤り訂正の前に、指定されたマスクでXOR解除を行う！
     if (appEncMask && appEncMask.length > 0) {
         for (var i = 0; i < codewords.length; i++) {
             codewords[i] ^= appEncMask[i];
@@ -781,7 +775,6 @@ function decodeMatrix(matrix, appEncMask) {
     if (!dataBlocks) {
         return null;
     }
-    // Count total number of data bytes
     var totalBytes = dataBlocks.reduce(function (a, b) { return a + b.numDataCodewords; }, 0);
     var resultBytes = new Uint8ClampedArray(totalBytes);
     var resultIndex = 0;
@@ -802,7 +795,7 @@ function decodeMatrix(matrix, appEncMask) {
         return null;
     }
 }
-// ★修正：decode が appEncMask を受け取れるように変更
+// ★ appEncMask を受け取れるように変更
 function decode(matrix, appEncMask) {
     if (matrix == null) {
         return null;
@@ -811,7 +804,6 @@ function decode(matrix, appEncMask) {
     if (result) {
         return result;
     }
-    // Decoding didn't work, try mirroring the QR across the topLeft -> bottomRight line.
     for (var x = 0; x < matrix.width; x++) {
         for (var y = x + 1; y < matrix.height; y++) {
             if (matrix.get(x, y) !== matrix.get(y, x)) {
