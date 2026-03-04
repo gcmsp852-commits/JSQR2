@@ -166,13 +166,17 @@
     let isProcessing = false;
     let isScanning = false;
     let lastDetectTime = 0;
-    const SCAN_INTERVAL_MS = 150; // QRツイン向けに短縮
+    const SCAN_INTERVAL_MS = 150; 
 
     let firstQR = null;
     let secondQR = null;
     
     let appPassword = null;
     let appMask = null;
+
+    // ★ RAWデータと画面描画用の座標を一時保存するための変数を追加
+    let savedSecondQrRawData = null;
+    let savedSecondQrPoints = null;
 
     async function startApp() {
         document.getElementById('startBtn').disabled = true;
@@ -181,7 +185,7 @@
             alert("jsQR.jsの読み込みに失敗しました。");
             return;
         }
-        document.getElementById('detectorInfo').innerText = "⚡ エンジン: カスタム jsQR (多段画像処理+全反転モード対応)";
+        document.getElementById('detectorInfo').innerText = "⚡ エンジン: カスタム jsQR (一括RAW抽出＆瞬間復号対応)";
         
         try {
             const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
@@ -206,13 +210,40 @@
         document.getElementById('passwordScreen').style.display = 'flex';
     }
 
+    // ★ パスワード入力後、再スキャンせずに保存したRAWデータから一瞬で復号する処理
     function submitPassword() {
         const pw = document.getElementById('appPasswordInput').value;
         if (pw) {
             appPassword = pw;
-            // jsQRの仕様上、十分な長さ(5000byte等)を作って渡します
             appMask = deriveEncryptionMaskBytes(appPassword, 5000);
+
+            // 保存しておいたRAWデータがある場合は、すぐに復号を実行！
+            if (savedSecondQrRawData) {
+                const decoded = jsQR.resumeDecode(savedSecondQrRawData, Array.from(appMask));
+                
+                if (decoded) {
+                    // 復号成功！結果をセットして完了画面へ
+                    secondQR = { 
+                        text: decoded.text, 
+                        managementCode: decoded.managementCode, 
+                        points: savedSecondQrPoints, 
+                        center: getCenter(savedSecondQrPoints) 
+                    };
+                    updateUI();
+                    document.getElementById('passwordScreen').style.display = 'none';
+                    showResultScreen();
+                    return;
+                } else {
+                    alert("パスワードが間違っているか、データの復号に失敗しました。もう一度お試しください。");
+                    appPassword = null;
+                    appMask = null;
+                    // 失敗した場合はパスワードを消して再度入力を待つ
+                    return;
+                }
+            }
         }
+        
+        // （保険）RAWデータが保存されていなかった場合は、通常のスキャンに戻る
         document.getElementById('passwordScreen').style.display = 'none';
         isScanning = true;
         lastDetectTime = Date.now(); 
@@ -233,8 +264,6 @@
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     // 画像前処理ユーティリティ
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    // コントラスト強調・明度調整した新しいImageDataを返す
     function enhanceContrast(src, brightness, contrast) {
         const dst = new ImageData(new Uint8ClampedArray(src.data), src.width, src.height);
         const factor = (259 * (contrast + 255)) / (255 * (259 - contrast));
@@ -248,7 +277,6 @@
         return dst;
     }
 
-    // グレースケール変換して返す
     function toGrayscale(src) {
         const dst = new ImageData(new Uint8ClampedArray(src.data), src.width, src.height);
         for (let i = 0; i < dst.data.length; i += 4) {
@@ -258,7 +286,6 @@
         return dst;
     }
 
-    // シャープネス強調
     function sharpen(src) {
         const w = src.width, h = src.height;
         const dst = new ImageData(new Uint8ClampedArray(src.data), w, h);
@@ -279,7 +306,6 @@
         return dst;
     }
 
-    // 適応的二値化（局所平均との比較）
     function adaptiveThreshold(src, blockSize, offset) {
         const w = src.width, h = src.height;
         const dst = new ImageData(new Uint8ClampedArray(src.data), w, h);
@@ -305,50 +331,51 @@
         return dst;
     }
 
-    // 画像を複数の前処理バリエーションで試行し、読み取れたコードをすべて返す
-    function tryAllVariants(baseImageData, maskOpts) {
+    // ★ オプションに extractRawOnly を渡せるように改良
+    function tryAllVariants(baseImageData, maskOpts, extractRaw = false) {
         const results = [];
         const seen = new Set();
 
         const tryDecode = (imgData, opts) => {
             try {
                 const code = jsQR(imgData.data, imgData.width, imgData.height, opts);
-                if (code && !seen.has(code.data)) {
-                    seen.add(code.data);
+                if (code) {
                     const pts = [code.location.topLeftCorner, code.location.topRightCorner, code.location.bottomRightCorner, code.location.bottomLeftCorner];
-                    results.push({ text: code.data, managementCode: code.managementCode, points: pts, center: getCenter(pts), usedMask: !!(opts && opts.appEncMask) });
+                    
+                    if (opts.extractRawOnly) {
+                        // RAWデータ抽出モードの場合
+                        if (!seen.has("raw")) {
+                            seen.add("raw");
+                            results.push({ isRaw: true, rawObj: code, points: pts, center: getCenter(pts), location: code.location });
+                        }
+                    } else {
+                        // 通常読み取りモードの場合
+                        if (!seen.has(code.data)) {
+                            seen.add(code.data);
+                            results.push({ text: code.data, managementCode: code.managementCode, points: pts, center: getCenter(pts), location: code.location, usedMask: !!(opts && opts.appEncMask) });
+                        }
+                    }
                 }
             } catch(e) {}
         };
 
-        // 前処理バリエーション一覧
         const gray = toGrayscale(baseImageData);
         const variants = [
-            baseImageData,                          // 1. そのまま
-            gray,                                   // 2. グレースケール
-            enhanceContrast(gray, 0, 80),           // 3. コントラスト強め
-            enhanceContrast(gray, 20, 60),          // 4. 明るさ+コントラスト
-            enhanceContrast(gray, -20, 60),         // 5. 暗め+コントラスト
-            sharpen(gray),                          // 6. シャープ
-            enhanceContrast(sharpen(gray), 0, 100), // 7. シャープ+高コントラスト
-            adaptiveThreshold(gray, 15, 10),        // 8. 適応二値化(小ブロック)
-            adaptiveThreshold(gray, 31, 15),        // 9. 適応二値化(大ブロック)
-            adaptiveThreshold(gray, 31, 5),         // 10. 適応二値化(低オフセット)
+            baseImageData, gray, enhanceContrast(gray, 0, 80), enhanceContrast(gray, 20, 60),
+            enhanceContrast(gray, -20, 60), sharpen(gray), enhanceContrast(sharpen(gray), 0, 100),
+            adaptiveThreshold(gray, 15, 10), adaptiveThreshold(gray, 31, 15), adaptiveThreshold(gray, 31, 5),
         ];
 
-        // inversionAttempts の各モード
         const invModes = ['dontInvert', 'attemptBoth', 'invertFirst', 'onlyInvert'];
 
         for (const variant of variants) {
             for (const inv of invModes) {
-                // マスクなし
-                tryDecode(variant, { inversionAttempts: inv });
-                // マスクあり（パスワード設定済みの場合）
-                if (maskOpts) {
-                    tryDecode(variant, { inversionAttempts: inv, appEncMask: maskOpts });
-                }
-                // 2つ見つかったら十分
-                if (results.length >= 2) return results;
+                let opts = { inversionAttempts: inv };
+                if (extractRaw) opts.extractRawOnly = true;
+                if (maskOpts) opts.appEncMask = maskOpts;
+
+                tryDecode(variant, opts);
+                if (results.length > 0) return results; // 1つ見つかれば即座に返す（高速化）
             }
         }
         return results;
@@ -377,27 +404,54 @@
                 zxingCtx.drawImage(video, 0, 0, zxingCanvas.width, zxingCanvas.height);
                 const imageData = zxingCtx.getImageData(0, 0, zxingCanvas.width, zxingCanvas.height);
 
-                const maskOpts = appMask ? Array.from(appMask) : null;
+                // ① まず通常のデコードを試みる（第1QRを探す）
+                const foundItems = tryAllVariants(imageData, null, false);
 
-                // ━━ 複数バリエーション × 複数inversionモードで総当たりスキャン ━━
-                const found = tryAllVariants(imageData, maskOpts);
+                if (foundItems.length > 0) {
+                    const item1 = foundItems[0];
+                    const mgmtStr = item1.managementCode !== undefined ? item1.managementCode.toString(2).padStart(16, '0') : "0000000000000000";
 
-                for (const item of found) {
-                    const mgmtStr = item.managementCode !== undefined
-                        ? item.managementCode.toString(2).padStart(16, '0')
-                        : "0000000000000000";
-
-                    // 第1QRで暗号化フラグON → パスワード要求
-                    if (!item.usedMask && mgmtStr[7] === '1') {
+                    // ② 第1QRが暗号化フラグONの場合、同じフレーム内で第2QRのRAWデータを抽出する！
+                    if (!item1.usedMask && mgmtStr[7] === '1') {
                         if (!appPassword && document.getElementById('passwordScreen').style.display !== 'flex') {
-                            detectedItems = [item];
-                            processDetections(detectedItems);
-                            showPasswordScreen();
-                            isProcessing = false;
-                            return;
+                            
+                            // 1個目のファインダパターンを白塗りする（ピンポイント目隠し）
+                            zxingCtx.fillStyle = '#FFFFFF';
+                            const qrSize = getDistance(item1.location.topLeftCorner, item1.location.topRightCorner);
+                            const r = qrSize * 0.15;
+                            const loc = item1.location;
+                            const fps = [
+                                loc.topLeftFinderPattern || loc.topLeftCorner,
+                                loc.topRightFinderPattern || loc.topRightCorner,
+                                loc.bottomLeftFinderPattern || loc.bottomLeftCorner
+                            ];
+                            fps.forEach(fp => {
+                                zxingCtx.beginPath(); zxingCtx.arc(fp.x, fp.y, r, 0, 2 * Math.PI); zxingCtx.fill();
+                            });
+
+                            // 白塗りした新しい画像データを取得
+                            const imageData2 = zxingCtx.getImageData(0, 0, zxingCanvas.width, zxingCanvas.height);
+                            
+                            // ③ 【重要】extractRawOnly=true で第2QRのRAWデータのみを安全に抽出
+                            const foundRawItems = tryAllVariants(imageData2, null, true);
+
+                            if (foundRawItems.length > 0) {
+                                // 見つかったら、UI表示用に1個目を登録し、2個目のRAWデータを保存してパスワード画面へ
+                                firstQR = item1;
+                                updateUI();
+                                
+                                savedSecondQrRawData = foundRawItems[0].rawObj; // RAWデータをグローバル変数に退避
+                                savedSecondQrPoints = foundRawItems[0].points;  // 描画用の座標も退避
+
+                                showPasswordScreen();
+                                isProcessing = false;
+                                return;
+                            }
                         }
                     }
-                    detectedItems.push(item);
+
+                    // 通常のQR（またはパスワード入力済みで復号できたQR）をリストに追加
+                    detectedItems.push(item1);
                 }
 
             } catch (err) { console.warn('scan error:', err); }
@@ -469,6 +523,7 @@
 
     function goBack() {
         firstQR = null; secondQR = null; appPassword = null; appMask = null;
+        savedSecondQrRawData = null; savedSecondQrPoints = null; // ★ 保存データもリセット
         document.getElementById('text1').innerText = "未検出"; document.getElementById('text2').innerText = "未検出";
         document.getElementById('mg1').innerText = "--"; document.getElementById('mg2').innerText = "--";
         document.getElementById('resultScreen').style.display = 'none';

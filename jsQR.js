@@ -323,12 +323,20 @@ exports.default = GenericGFPoly;
 
 "use strict";
 
+var __assign = (this && this.__assign) || Object.assign || function(t) {
+    for (var s, i = 1, n = arguments.length; i < n; i++) {
+        s = arguments[i];
+        for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))
+            t[p] = s[p];
+    }
+    return t;
+};
 Object.defineProperty(exports, "__esModule", { value: true });
 var binarizer_1 = __webpack_require__(4);
+// ★ require をやめて、ここで resumeDecode も一緒に読み込むように変更！
 var decoder_1 = __webpack_require__(5);
 var extractor_1 = __webpack_require__(11);
 var locator_1 = __webpack_require__(12);
-// ★ options を受け取れるように変更
 function scan(matrix, options) {
     var locations = locator_1.locate(matrix);
     if (!locations) {
@@ -337,10 +345,20 @@ function scan(matrix, options) {
     for (var _i = 0, locations_1 = locations; _i < locations_1.length; _i++) {
         var location_1 = locations_1[_i];
         var extracted = extractor_1.extract(matrix, location_1);
-        // ★ decode関数に appEncMask を渡す
-        // ★ decode関数に appEncMask を渡す
-        var decoded = decoder_1.decode(extracted.matrix, options ? options.appEncMask : undefined);
+        var decoded = decoder_1.decode(extracted.matrix, options);
         if (decoded) {
+            if (options && options.extractRawOnly) {
+                return __assign({}, decoded, { location: {
+                        topRightCorner: extracted.mappingFunction(location_1.dimension, 0),
+                        topLeftCorner: extracted.mappingFunction(0, 0),
+                        bottomRightCorner: extracted.mappingFunction(location_1.dimension, location_1.dimension),
+                        bottomLeftCorner: extracted.mappingFunction(0, location_1.dimension),
+                        topRightFinderPattern: location_1.topRight,
+                        topLeftFinderPattern: location_1.topLeft,
+                        bottomLeftFinderPattern: location_1.bottomLeft,
+                        bottomRightAlignmentPattern: location_1.alignmentPattern,
+                    } });
+            }
             return {
                 binaryData: decoded.bytes,
                 data: decoded.text,
@@ -368,15 +386,14 @@ var defaultOptions = {
 };
 function jsQR(data, width, height, providedOptions) {
     if (providedOptions === void 0) { providedOptions = {}; }
-    // ★ defaultOptionsとprovidedOptionsを合成して、appEncMaskを確実に引き継ぐ
     var options = {
         inversionAttempts: providedOptions.inversionAttempts || defaultOptions.inversionAttempts,
-        appEncMask: providedOptions.appEncMask
+        appEncMask: providedOptions.appEncMask,
+        extractRawOnly: providedOptions.extractRawOnly
     };
     var shouldInvert = options.inversionAttempts === "attemptBoth" || options.inversionAttempts === "invertFirst";
     var tryInvertedFirst = options.inversionAttempts === "onlyInvert" || options.inversionAttempts === "invertFirst";
     var _a = binarizer_1.binarize(data, width, height, shouldInvert), binarized = _a.binarized, inverted = _a.inverted;
-    // ★ scan関数に options を渡す
     var result = scan(tryInvertedFirst ? inverted : binarized, options);
     if (!result && (options.inversionAttempts === "attemptBoth" || options.inversionAttempts === "invertFirst")) {
         result = scan(tryInvertedFirst ? binarized : inverted, options);
@@ -384,6 +401,10 @@ function jsQR(data, width, height, providedOptions) {
     return result;
 }
 jsQR.default = jsQR;
+// ★ require() をやめて、上部でインポートした関数を直接使うように変更！
+jsQR.resumeDecode = function (rawData, appMask) {
+    return decoder_1.resumeDecode(rawData, appMask);
+};
 exports.default = jsQR;
 
 
@@ -755,8 +776,8 @@ function getDataBlocks(codewords, version, ecLevel) {
     }
     return dataBlocks;
 }
-// ★ appEncMask を受け取れるように変更
-function decodeMatrix(matrix, appEncMask) {
+// ★ options 全体を受け取れるように変更
+function decodeMatrix(matrix, options) {
     var version = readVersion(matrix);
     if (!version) {
         return null;
@@ -766,6 +787,18 @@ function decodeMatrix(matrix, appEncMask) {
         return null;
     }
     var codewords = readCodewords(matrix, version, formatInfo);
+    // ★ 追加：寸止めロジック（RAWデータ抽出）
+    // extractRawOnly が true の場合、XORや誤り訂正を行わず、ここでRAWデータを返す
+    if (options && options.extractRawOnly) {
+        return {
+            isRaw: true,
+            codewords: codewords,
+            version: version,
+            formatInfo: formatInfo
+        };
+    }
+    // ★ options から appEncMask を取り出す
+    var appEncMask = options ? options.appEncMask : undefined;
     // ★ 誤り訂正の前に、指定されたマスクでXOR解除を行う！
     if (appEncMask && appEncMask.length > 0) {
         for (var i = 0; i < codewords.length; i++) {
@@ -796,12 +829,12 @@ function decodeMatrix(matrix, appEncMask) {
         return null;
     }
 }
-// ★ appEncMask を受け取れるように変更
-function decode(matrix, appEncMask) {
+// ★ options 全体を受け取れるように、引数と戻り値（anyを追加）を変更
+function decode(matrix, options) {
     if (matrix == null) {
         return null;
     }
-    var result = decodeMatrix(matrix, appEncMask);
+    var result = decodeMatrix(matrix, options);
     if (result) {
         return result;
     }
@@ -813,9 +846,48 @@ function decode(matrix, appEncMask) {
             }
         }
     }
-    return decodeMatrix(matrix, appEncMask);
+    return decodeMatrix(matrix, options);
 }
 exports.decode = decode;
+// ★ 新設：保存しておいたRAWデータとマスクから処理を再開する関数
+function resumeDecode(rawData, appMask) {
+    try {
+        var codewords = rawData.codewords, version = rawData.version, formatInfo = rawData.formatInfo;
+        // 元の配列を破壊しないようにコピーを作成
+        var decryptedCodewords = codewords.slice();
+        // 1. マスク（XOR）による暗号解除
+        if (appMask && appMask.length > 0) {
+            for (var i = 0; i < decryptedCodewords.length; i++) {
+                decryptedCodewords[i] ^= appMask[i];
+            }
+        }
+        // 2. ブロック分割＋インタリーブ解除
+        var dataBlocks = getDataBlocks(decryptedCodewords, version, formatInfo.errorCorrectionLevel);
+        if (!dataBlocks) {
+            return null;
+        }
+        var totalBytes = dataBlocks.reduce(function (a, b) { return a + b.numDataCodewords; }, 0);
+        var resultBytes = new Uint8ClampedArray(totalBytes);
+        var resultIndex = 0;
+        // 3. 誤り訂正（ここで初めてRSを実行）
+        for (var _i = 0, dataBlocks_4 = dataBlocks; _i < dataBlocks_4.length; _i++) {
+            var dataBlock = dataBlocks_4[_i];
+            var correctedBytes = reedsolomon_1.decode(dataBlock.codewords, dataBlock.codewords.length - dataBlock.numDataCodewords);
+            if (!correctedBytes) {
+                return null;
+            } // 復号失敗（パスワード間違いなどでエラー訂正不可）
+            for (var i = 0; i < dataBlock.numDataCodewords; i++) {
+                resultBytes[resultIndex++] = correctedBytes[i];
+            }
+        }
+        // 4. 文字列へのデコード（Decode payload）
+        return decodeData_1.decode(resultBytes, version.versionNumber);
+    }
+    catch (e) {
+        return null;
+    }
+}
+exports.resumeDecode = resumeDecode;
 
 
 /***/ }),
